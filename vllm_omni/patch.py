@@ -71,6 +71,118 @@ assert _installed is _patched_cp, (
 )
 
 # =============================================================================
+# Patch ModelOptNvFp4FusedMoE to handle W4A16_NVFP4 MoE checkpoints
+# =============================================================================
+# WHY: vLLM 0.21.0's ModelOptNvFp4FusedMoE.__init__ unconditionally passes
+# activation_key=kNvfp4Dynamic to select_nvfp4_moe_backend, which forces a
+# W4A4 backend (CUTLASS / FlashInfer / TRT-LLM). When the on-disk checkpoint
+# is W4A16_NVFP4 (no input_scale tensors, BF16 activations), the chosen
+# backend's create_weights allocates W4A4-shaped params, and the W4A16
+# packed weights from the safetensors file fail the shape assertion in
+# vllm.model_executor.layers.linear.weight_loader with messages like
+# "Tried to load weights of size [128, 2048] to a parameter of size
+# [128, 1024]". Loading any Qwen3-MoE-style W4A16_NVFP4 checkpoint dies at
+# worker init.
+#
+# Upstream fix landed as vllm PR #42566 (merged 2026-05-22, after v0.21.0):
+# pass activation_key=None when quant_method=="W4A16_NVFP4", forcing the
+# only backend (Marlin) whose _supports_quant_scheme tolerates absent
+# activation quantization. Marlin's MoE path drops activation scales in
+# convert_to_nvfp4_moe_kernel_format, so the rest of the init is unchanged.
+#
+# This patch backports that one behavioral change to whatever pre-fix vllm
+# version vllm-omni is pinned against.
+#
+# WHY NOT model-level: ModelOptNvFp4FusedMoE is selected by vLLM's
+# ModelOptNvFp4Config.get_quant_method when the layer is a FusedMoE — model
+# code never instantiates it directly and has no hook to override.
+#
+# SCOPE: Affects only ModelOptNvFp4FusedMoE init. Dense W4A16 (via
+# ModelOptNvFp4W4A16LinearMethod) is unaffected — it already works in
+# v0.21.0. Mixed-precision FP8+W4A16 dispatch (the other half of PR #42566)
+# is not backported — vllm-omni's quantization factory does not currently
+# accept MIXED_PRECISION checkpoints that span both FP8 and W4A16 layers.
+#
+# FRAGILITY: Relies on (a) select_nvfp4_moe_backend continuing to accept
+# activation_key=None and select Marlin in that case, and (b) Marlin's MoE
+# kernel continuing to ignore the absent activation scales. Both are stable
+# on the relevant code paths in v0.21.0–main. If a future vLLM minor
+# refactors the backend-selection contract, this patch breaks loudly at
+# import (the assert below) rather than silently mis-loading weights.
+#
+# TODO: Remove once vllm-omni bumps its vllm pin to a release that contains
+# #42566 (expected vllm 0.22+). The assert below will signal "already
+# patched upstream" so we know it's safe to delete.
+try:
+    # kNvfp4Static moved between vllm versions: in v0.21.0 it lives in
+    # `quantization.utils.quant_utils`; in some later versions it's re-exported
+    # from `fused_moe.oracle.nvfp4`. Try the new path first, fall back.
+    try:
+        from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+            kNvfp4Static,
+        )
+    except ImportError:
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kNvfp4Static,
+        )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        select_nvfp4_moe_backend,
+    )
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4FusedMoE as _OriginalModelOptNvFp4FusedMoE,
+    )
+    from vllm.model_executor.layers.quantization.modelopt import (
+        is_global_sf_supported_for_nvfp4_backend,
+    )
+except ImportError as _w4a16_patch_import_err:
+    # Patch surface not importable in this build — log loudly. Silent passing
+    # bit us 2026-05-25 when an import path differed between vllm versions
+    # and the W4A16 MoE checkpoint silently fell through to the broken W4A4
+    # backend selection. Use vllm-omni's logger so the warning lands in the
+    # standard worker stderr, not a separate channel.
+    import logging as _logging
+
+    _logging.getLogger("vllm_omni.patch").warning(
+        "W4A16_NVFP4 MoE backport patch could NOT install: %s. "
+        "Loading W4A16_NVFP4 MoE checkpoints will likely fail with a "
+        "weight-loader shape mismatch at worker init. Check vllm version "
+        "and import paths.",
+        _w4a16_patch_import_err,
+    )
+else:
+    _original_nvfp4_fused_moe_init = _OriginalModelOptNvFp4FusedMoE.__init__
+    # If upstream already shipped the use_a16 flag (vllm post-#42566), the
+    # backport is redundant. Detect by reading the source of __init__ — if
+    # "use_a16" appears in the bytecode constants, upstream has it.
+    _already_patched_upstream = any(
+        isinstance(c, str) and "use_a16" in c
+        for c in (_original_nvfp4_fused_moe_init.__code__.co_consts or ())
+    ) or "use_a16" in (_original_nvfp4_fused_moe_init.__code__.co_varnames or ())
+
+    def _patched_nvfp4_fused_moe_init(self, quant_config, moe_config):
+        _original_nvfp4_fused_moe_init(self, quant_config, moe_config)
+        # If upstream is patched, the original __init__ already set use_a16
+        # correctly — don't double-apply.
+        if _already_patched_upstream:
+            return
+        self.use_a16 = getattr(quant_config, "quant_method", None) == "W4A16_NVFP4"
+        if not self.use_a16:
+            return
+        # Re-run backend selection with activation_key=None. The W4A4
+        # backends all reject this; only Marlin survives. Marlin handles
+        # W4A16 MoE correctly.
+        self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
+            config=self.moe,
+            weight_key=kNvfp4Static,
+            activation_key=None,
+        )
+        self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
+            self.nvfp4_backend
+        )
+
+    _OriginalModelOptNvFp4FusedMoE.__init__ = _patched_nvfp4_fused_moe_init
+
+# =============================================================================
 # Patch GlmImageTextConfig to expose mrope_section in rope_parameters
 # =============================================================================
 # GLM-Image uses M-RoPE with mrope_section: [8, 12, 12], but transformers'

@@ -1,0 +1,199 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""E2E tests for Qwen3-Omni ModelOpt NVFP4 W4A16 quantized inference.
+
+Mirror of test_qwen3_omni_autoround_w4a16_expansion.py for ModelOpt's
+NVFP4 weight-only path. The thinker LM is quantized to NVFP4 W4A16
+(packed FP4 weights + FP8 per-block scales + FP32 per-tensor scale;
+BF16 activations). Audio/vision encoders, talker, and code2wav stay
+BF16 via the PRE_QUANTIZED_METHODS encoder-exclusion path.
+
+Requirements:
+  - CUDA GPUs (2x H100-80G or equivalent; Marlin path works on sm_80+)
+  - One of the published quantized checkpoints below
+"""
+
+import os
+
+import pytest
+
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import (
+    generate_synthetic_audio,
+    generate_synthetic_image,
+    generate_synthetic_video,
+)
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.omni,
+]
+
+QUANTIZED_MODEL = "YihongJin/Qwen3-Omni-30B-A3B-Instruct-NVFP4-W4A16-awq"
+BASELINE_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+
+QUANTIZED_MODEL = os.environ.get("QWEN3_OMNI_MODELOPT_NVFP4_MODEL", QUANTIZED_MODEL)
+BASELINE_MODEL = os.environ.get("QWEN3_OMNI_BASELINE_MODEL", BASELINE_MODEL)
+
+_CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _qwen3_omni_env():
+    """Set env vars required by multi-stage worker spawning.
+
+    Must run before CUDA context init.  Reverted after every test module
+    so that values do not leak into unrelated test files.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        yield
+
+
+def _get_stage_config():
+    """Build a CI-friendly stage config with eager mode."""
+    return modify_stage_config(
+        _CI_DEPLOY,
+        updates={
+            "stages": {
+                0: {"enforce_eager": True},
+                1: {"enforce_eager": True},
+            },
+        },
+    )
+
+
+stage_config = _get_stage_config()
+
+quant_params = [(QUANTIZED_MODEL, stage_config)]
+
+
+# ------------------------------------------------------------------
+# Test: text-only input → text output
+# ------------------------------------------------------------------
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
+def test_text_to_text(omni_runner, omni_runner_handler):
+    """Text input → text output with NVFP4 W4A16 quantized Qwen3-Omni."""
+    request_config = {
+        "prompts": "What is the capital of France?",
+        "modalities": ["text"],
+    }
+    response = omni_runner_handler.send_request(request_config)
+    assert response.success, "Request failed"
+    assert response.text_content and len(response.text_content.strip()) > 0
+
+
+# ------------------------------------------------------------------
+# Test: audio input → text output
+# ------------------------------------------------------------------
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
+def test_audio_to_text(omni_runner, omni_runner_handler):
+    """Audio input → text output with NVFP4 W4A16 quantized Qwen3-Omni."""
+    audio = generate_synthetic_audio(1, 1, 16000)["np_array"]
+    if len(audio.shape) == 2:
+        audio = audio.squeeze()
+
+    request_config = {
+        "prompts": "What is the content of this audio?",
+        "audios": (audio, 16000),
+        "modalities": ["text"],
+    }
+    response = omni_runner_handler.send_request(request_config)
+    assert response.success, "Request failed"
+    assert response.text_content and len(response.text_content.strip()) > 0
+
+
+# ------------------------------------------------------------------
+# Test: image input → text output
+# ------------------------------------------------------------------
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
+def test_image_to_text(omni_runner, omni_runner_handler):
+    """Image input → text output with NVFP4 W4A16 quantized Qwen3-Omni."""
+    image = generate_synthetic_image(16, 16)["np_array"]
+
+    request_config = {
+        "prompts": "Describe what you see in this image.",
+        "images": image,
+        "modalities": ["text"],
+    }
+    response = omni_runner_handler.send_request(request_config)
+    assert response.success, "Request failed"
+    assert response.text_content and len(response.text_content.strip()) > 0
+
+
+# ------------------------------------------------------------------
+# Test: video input → text output
+# ------------------------------------------------------------------
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
+def test_video_to_text(omni_runner, omni_runner_handler):
+    """Video input → text output with NVFP4 W4A16 quantized Qwen3-Omni."""
+    video = generate_synthetic_video(224, 224, 300)["np_array"]
+
+    request_config = {
+        "prompts": "Describe the video briefly.",
+        "videos": video,
+        "modalities": ["text"],
+    }
+    response = omni_runner_handler.send_request(request_config)
+    assert response.success, "Request failed"
+    assert response.text_content and len(response.text_content.strip()) > 0
+
+
+# ------------------------------------------------------------------
+# Test: video input → audio output (talker + code2wav stay BF16)
+# ------------------------------------------------------------------
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
+def test_video_to_audio(omni_runner, omni_runner_handler):
+    """Video input → audio output. Verifies the talker/code2wav BF16 path
+    still runs alongside an NVFP4-quantized thinker."""
+    video = generate_synthetic_video(224, 224, 300)["np_array"]
+
+    request_config = {
+        "prompts": "Describe the video briefly.",
+        "videos": video,
+        "modalities": ["audio"],
+    }
+    response = omni_runner_handler.send_request(request_config)
+    assert response.success, "Request failed"
+
+
+# ------------------------------------------------------------------
+# Test: mixed modality (audio + image + video) → audio output
+# ------------------------------------------------------------------
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
+def test_mix_to_audio(omni_runner, omni_runner_handler):
+    """Mixed-modality input → audio output with NVFP4 W4A16 thinker."""
+    video = generate_synthetic_video(224, 224, 300)["np_array"]
+    image = generate_synthetic_image(16, 16)["np_array"]
+    audio = generate_synthetic_audio(1, 1, 16000)["np_array"]
+    if len(audio.shape) == 2:
+        audio = audio.squeeze()
+
+    request_config = {
+        "prompts": "What is recited in the audio? What is in this image? Describe the video briefly.",
+        "videos": video,
+        "images": image,
+        "audios": (audio, 16000),
+        "modalities": ["audio"],
+    }
+    response = omni_runner_handler.send_request(request_config)
+    assert response.success, "Request failed"

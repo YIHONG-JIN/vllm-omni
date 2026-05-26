@@ -34,12 +34,13 @@ and the quantization algorithm must be one of the validated algorithms below.
 |------------------|-----------------|
 | `method` / `quant_method` | `modelopt`, `modelopt_fp4`, `modelopt_mixed` |
 | `producer.name` | `modelopt` |
-| `quant_algo` | `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `NVFP4`, `MIXED_PRECISION` |
+| `quant_algo` | `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `NVFP4`, `W4A16_NVFP4`, `MIXED_PRECISION` |
 
 | `quant_algo` | Runtime method | Typical use |
 |--------------|----------------|-------------|
 | `FP8`, `FP8_PER_CHANNEL_PER_TOKEN` | `modelopt` | FP8 diffusion transformer checkpoints |
 | `NVFP4` | `modelopt_fp4` | NVFP4 diffusion transformer checkpoints |
+| `W4A16_NVFP4` | `modelopt_fp4` | NVFP4 weight-only checkpoints (FP4 weights + BF16 activations); runs on sm_80+ via FP4 Marlin |
 | `MIXED_PRECISION` | `modelopt_mixed` | Mixed FP8/NVFP4 checkpoints with a ModelOpt per-layer policy |
 
 For multi-component diffusion or omni models, only the checkpoint component
@@ -89,6 +90,7 @@ and
 | Model | Scope | Status |
 |-------|-------|--------|
 | Qwen3-Omni | Thinker language-model stage | ModelOpt FP8 checkpoint path |
+| Qwen3-Omni | Thinker language-model stage | ModelOpt NVFP4 W4A16 checkpoint path (e.g. `YihongJin/Qwen3-Omni-30B-A3B-Instruct-NVFP4-W4A16-awq`) |
 | Qwen3-TTS | TTS language-model stage | Not validated |
 
 Audio encoder, vision encoder, talker, and code2wav stages stay in BF16 unless
