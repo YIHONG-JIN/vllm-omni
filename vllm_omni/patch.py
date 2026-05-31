@@ -107,12 +107,16 @@ assert _installed is _patched_cp, (
 # activation_key=None and select Marlin in that case, and (b) Marlin's MoE
 # kernel continuing to ignore the absent activation scales. Both are stable
 # on the relevant code paths in v0.21.0–main. If a future vLLM minor
-# refactors the backend-selection contract, this patch breaks loudly at
-# import (the assert below) rather than silently mis-loading weights.
+# refactors the backend-selection contract (e.g. renames the activation_key
+# kwarg or returns a different backend tuple), the failure surfaces at the
+# first W4A16_NVFP4 MoE layer instantiation (worker init), not at module
+# import — see the install-time `_already_patched_upstream` probe below as
+# the only import-time signal.
 #
 # TODO: Remove once vllm-omni bumps its vllm pin to a release that contains
-# #42566 (expected vllm 0.22+). The assert below will signal "already
-# patched upstream" so we know it's safe to delete.
+# #42566 (expected vllm 0.22+). The `_already_patched_upstream` check below
+# is intended to detect that case at install time and skip our backport so
+# we don't double-apply the fix.
 try:
     # kNvfp4Static moved between vllm versions: in v0.21.0 it lives in
     # `quantization.utils.quant_utils`; in some later versions it's re-exported
@@ -152,15 +156,16 @@ except ImportError as _w4a16_patch_import_err:
 else:
     _original_nvfp4_fused_moe_init = _OriginalModelOptNvFp4FusedMoE.__init__
     # If upstream already shipped the use_a16 flag (vllm post-#42566), the
-    # backport is redundant. Detect by reading the source of __init__ — if
-    # "use_a16" appears in the bytecode constants, upstream has it.
-    _already_patched_upstream = any(
-        isinstance(c, str) and "use_a16" in c
-        for c in (_original_nvfp4_fused_moe_init.__code__.co_consts or ())
-    ) or "use_a16" in (_original_nvfp4_fused_moe_init.__code__.co_varnames or ())
+    # backport is redundant. `self.use_a16 = ...` is compiled as STORE_ATTR
+    # which stores the attribute name in __code__.co_names (NOT co_consts
+    # or co_varnames). Match the exact name to avoid substring false
+    # positives from unrelated docstrings/messages mentioning "use_a16".
+    _already_patched_upstream = "use_a16" in (
+        _original_nvfp4_fused_moe_init.__code__.co_names or ()
+    )
 
-    def _patched_nvfp4_fused_moe_init(self, quant_config, moe_config):
-        _original_nvfp4_fused_moe_init(self, quant_config, moe_config)
+    def _patched_nvfp4_fused_moe_init(self, quant_config, moe_config, *args, **kwargs):
+        _original_nvfp4_fused_moe_init(self, quant_config, moe_config, *args, **kwargs)
         # If upstream is patched, the original __init__ already set use_a16
         # correctly — don't double-apply.
         if _already_patched_upstream:
